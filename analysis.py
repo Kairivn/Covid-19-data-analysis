@@ -1,22 +1,9 @@
+# COVID-19 India Cases Explorer — Streamlit Dashboard
+# ==================================================
+# An interactive dashboard for exploring COVID-19 case data across India
+# and its states/union territories.
+
 from typing import Union
-
-"""
-COVID-19 India Cases Explorer — Streamlit Dashboard
-====================================================
-An interactive dashboard for exploring COVID-19 case data across India
-and its states/union territories.
-
-Features
---------
-* National & region-level KPI cards
-* Daily new-case trends with 7-day rolling averages
-* Recovery rate & case fatality rate analysis
-* Top-states comparison bar / pie / line charts
-* Choropleth-style heatmap of states by selected metric
-* Downloadable filtered data
-
-Data source: ``covid_india_cases.csv`` (bundled with the repo).
-"""
 
 import streamlit as st
 import pandas as pd
@@ -37,24 +24,29 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* metric cards */
+    /* metric cards — responsive sizing so numbers are never truncated */
     div[data-testid="stMetric"] {
         background: linear-gradient(135deg, #1e1e2f 0%, #2d2d44 100%);
         border: 1px solid rgba(255,255,255,0.08);
         border-radius: 12px;
-        padding: 16px 20px;
+        padding: 18px 22px;
         box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        min-width: 0;           /* allow flex shrink */
+        overflow: visible;      /* never clip numbers */
     }
     div[data-testid="stMetric"] label {
         color: #a0aec0 !important;
-        font-size: 0.82rem !important;
+        font-size: 0.78rem !important;
         text-transform: uppercase;
         letter-spacing: 0.05em;
+        white-space: nowrap;
     }
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-        font-size: 1.7rem !important;
+        font-size: 1.35rem !important;
         font-weight: 700 !important;
         color: #e2e8f0 !important;
+        white-space: nowrap;
+        overflow: visible;
     }
     /* sidebar polish */
     section[data-testid="stSidebar"] {
@@ -98,6 +90,42 @@ def load_data(path: Path) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     df = df.sort_values(["Region", "Date"]).reset_index(drop=True)
+
+    # ── Fix single-day data glitches ───────────────────────────────────────
+    # Three patterns are detected and smoothed via interpolation:
+    # 1. Spike-then-drop: value jumps sharply, next day drops back
+    # 2. Dip-then-recovery: value drops sharply, next day jumps back
+    # 3. Backlog dump: zero new cases followed by a huge single-day dump
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+        for region in df["Region"].unique():
+            rmask = df["Region"] == region
+            series = df.loc[rmask, col].copy()
+            if len(series) < 5:
+                continue
+
+            diff = series.diff()
+            rolling_med = diff.rolling(14, min_periods=3, center=False).median().clip(lower=1)
+            next_diff = diff.shift(-1)
+            prev_diff = diff.shift(1)
+
+            bad = pd.Series(False, index=series.index)
+
+            # Pattern 1: spike up, then next day drops back
+            bad |= (diff > rolling_med * 5) & (next_diff < 0) & (next_diff.abs() > rolling_med * 3)
+
+            # Pattern 2: dip down, then next day jumps back (mark the dipped row)
+            bad |= (diff < -rolling_med * 5) & (next_diff > 0) & (next_diff > rolling_med * 3)
+
+            # Pattern 3: backlog — previous day had ~0 new cases, today has > 5× median
+            bad |= (prev_diff.abs() <= 1) & (diff > rolling_med * 5)
+
+            if bad.any():
+                series[bad] = np.nan
+                series = series.interpolate(method="linear").ffill().bfill()
+                df.loc[rmask, col] = series.astype(int)
+
     return df
 
 
@@ -190,13 +218,15 @@ cfr = round(100 * deaths / confirmed, 2) if confirmed else 0.0
 recovery_rate = round(100 * recovered / confirmed, 2) if confirmed else 0.0
 
 st.markdown("### 🇮🇳 National Summary")
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Confirmed", fmt(confirmed))
 c2.metric("Active", fmt(active))
 c3.metric("Recovered", fmt(recovered))
 c4.metric("Deaths", fmt(deaths))
-c5.metric("Recovery Rate", f"{recovery_rate}%")
-c6.metric("Case Fatality Rate", f"{cfr}%")
+
+nr1, nr2 = st.columns(2)
+nr1.metric("Recovery Rate", f"{recovery_rate}%")
+nr2.metric("Case Fatality Rate", f"{cfr}%")
 
 # ─── 2. Selected region KPIs ────────────────────────────────────────────────
 region_row = latest_snapshot[latest_snapshot["Region"] == selected_region]
@@ -214,13 +244,22 @@ r_recovery = round(100 * r_recovered / r_confirmed, 2) if r_confirmed else 0.0
 share_of_india = round(100 * r_confirmed / confirmed, 2) if confirmed else 0.0
 
 st.markdown(f"### 📍 {selected_region} — Latest Snapshot")
-r1, r2, r3, r4, r5, r6 = st.columns(6)
+r1, r2, r3, r4 = st.columns(4)
 r1.metric("Confirmed", fmt(r_confirmed))
 r2.metric("Active", fmt(r_active))
 r3.metric("Recovered", fmt(r_recovered))
 r4.metric("Deaths", fmt(r_deaths))
-r5.metric("Recovery Rate", f"{r_recovery}%")
-r6.metric("Share of India", f"{share_of_india}%")
+
+# Show share-of-India only for actual states/UTs (not for India or World)
+if selected_region not in ("India", "World"):
+    rr1, rr2, rr3 = st.columns(3)
+    rr1.metric("Recovery Rate", f"{r_recovery}%")
+    rr2.metric("Case Fatality Rate", f"{r_cfr}%")
+    rr3.metric("Share of India", f"{share_of_india}%")
+else:
+    rr1, rr2 = st.columns(2)
+    rr1.metric("Recovery Rate", f"{r_recovery}%")
+    rr2.metric("Case Fatality Rate", f"{r_cfr}%")
 
 st.markdown("---")
 
